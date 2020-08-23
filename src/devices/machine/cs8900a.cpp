@@ -652,23 +652,34 @@ u16 cs8900a_device::tfe_receive(void)
     u8 buffer[MAX_RXLENGTH];
 
     int  len;
-    int  hashed;
-    int  hash_index;
-    int  rx_ok;
-    int  correct_mac;
-    int  broadcast;
+    int  hashed = 0;
+    int  hash_index = 0;
+    int  rx_ok = 0;
+    int  correct_mac = 0;
+    int  broadcast = 0;
     int  multicast = 0;
-    int  crc_error;
+    int  crc_error = 0;
 
-    int  newframe;
+    int  newframe = 0;
 
-    int  ready;
+    int  ready = 0;
 
     do {
         len = MAX_RXLENGTH;
 
         ready = 1 ; /* assume we will find a good frame */
+        std::vector<u8> frame;
+        if (!m_frame_queue.empty()) {
+            std::vector<u8> frame = m_frame_queue.front();
+            m_frame_queue.pop();
+            len = frame.size();
+            std::memcpy(buffer, frame.data(), len);
+            newframe = 1;
+        } else {
+            newframe = 0;
+        }
 
+#if 0
         newframe = tfe_arch_receive(
             buffer,       /* where to store a frame */
             &len,         /* length of received frame */
@@ -679,7 +690,7 @@ u16 cs8900a_device::tfe_receive(void)
             &broadcast,   /* set if dest. address is a broadcast address */
             &crc_error    /* set if received frame had a CRC error */
             );
-
+#endif
         assert((len&1) == 0); /* length has to be even! */
 
         if (newframe) {
@@ -1714,4 +1725,11 @@ u8 cs8900a_device::read(u16 address) {
 
 void cs8900a_device::write(u16 address, u8 data) {
     return tfe_store(address, data);
+}
+
+int cs8900a_device::recv_start_cb(u8 *buf, int length) {
+    std::vector<u8> frame;
+    frame.assign(buf, buf+length);
+    m_frame_queue.push(frame);
+    return length;
 }

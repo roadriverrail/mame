@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include <queue>
+
 /***************************************************************************
     TYPE DEFINITIONS
 ***************************************************************************/
@@ -33,9 +35,7 @@ protected:
 	virtual void device_reset() override;
 
 	// device_network_interface overrides
-	virtual void send_complete_cb(int result) override;
 	virtual int recv_start_cb(u8 *buf, int length) override;
-	virtual void recv_complete_cb(int result) override;
 
 private:
 	int should_activate;
@@ -94,6 +94,8 @@ private:
 	unsigned long crc32_table[256];
 	int crc32_is_initialized;
 
+	//The frame queue
+	std::queue<std::vector<u8>> m_frame_queue;
 
 	void tfe_set_tx_status(int ready, int error);
 	void tfe_set_receiver(int enabled);
