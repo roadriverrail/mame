@@ -2,6 +2,9 @@
 
 #include "machine/cs8900a.h"
 
+DEFINE_DEVICE_TYPE(CS8900A,  cs8900a_device,  "CS8900A",  "CA8900A ETHERNET IC")
+
+
 #define CRC32_POLY  0xedb88320
 
 /* warn illegal behaviour */
@@ -512,6 +515,12 @@ cs8900a_device::cs8900a_device(const machine_config &mconfig, device_type type, 
     }
      
 }
+
+cs8900a_device::cs8900a_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+	: cs8900a_device(mconfig, CS8900A, tag, owner, clock)
+{
+}
+
 
 void cs8900a_device::tfe_shutdown(void)
 {

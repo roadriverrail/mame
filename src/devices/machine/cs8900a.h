@@ -24,6 +24,7 @@
 class cs8900a_device : public device_t, public device_network_interface
 {
 public:
+	cs8900a_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
 	u8 read(u16 address);
 	void write(u16 address, u8 data);
 
