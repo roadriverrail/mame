@@ -11,9 +11,10 @@ DEFINE_DEVICE_TYPE(CS8900A,  cs8900a_device,  "CS8900A",  "CA8900A ETHERNET IC")
 /* #define TFE_DEBUG_WARN_REG 1 */   /* warn about invalid register accesses */
 /* #define TFE_DEBUG_WARN_RXTX 1 */  /* warn about invalid rx or tx conditions */
 
+#define TFE_DEBUG 1 /* **/           /* enable to see tfe port reads */
 /** #define TFE_DEBUG_INIT 1 **/
-/** #define TFE_DEBUG_LOAD 1 **/           /* enable to see tfe port reads */
-/** #define TFE_DEBUG_STORE 1 **/          /* enable to see tfe port writes */
+#define TFE_DEBUG_LOAD 1 /* **/           /* enable to see tfe port reads */
+#define TFE_DEBUG_STORE 1 /* **/          /* enable to see tfe port writes */
 /** #define TFE_DEBUG_REGISTERS 1 **/      /* enable to see CS8900a register I/O */
 /** #define TFE_DEBUG_IGNORE_RXEVENT 1 **/ /* enable to ignore RXEVENT in DEBUG_REGISTERS */
 /** #define TFE_DEBUG_RXTX_STATE 1 **/     /* enable to see tranceiver state changes */
@@ -335,7 +336,7 @@ void cs8900a_device::device_reset(void)
         tfe_set_transmitter(0);
         tfe_set_receiver(0);
 
-        printf("CS8900a rev.D reset\n");
+        printf("CS8900a device_reset\n");
     }
 }
 
@@ -345,7 +346,7 @@ void cs8900a_device::device_start(void)
     assert( tfe_packetpage == NULL );
 
 #ifdef TFE_DEBUG
-    log_message( tfe_log, "tfe_activate_i()." );
+    log_message( tfe_log, "device_start().\n" );
 #endif
 
     /* allocate memory for visible IO register */
@@ -841,6 +842,9 @@ void cs8900a_device::tfe_write_tx_buffer(u8 value,int odd_address)
                 if (txcmd) {
                     txcmd = 0; //Jiggery pokery to ensure any side effects are preserved
                 }
+#ifdef TFE_DEBUG
+                printf("SENDING from buf %p len %d\n", &tfe_packetpage[TFE_PP_ADDR_TX_FRAMELOC], tx_length);
+#endif
                 send(&tfe_packetpage[TFE_PP_ADDR_TX_FRAMELOC],tx_length);
 #if 0 //Note that the txcmd is completely ignored in tfe_arch_transmit()
                 tfe_arch_transmit(
@@ -1128,6 +1132,9 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
         tfe_ia_mac[ppaddress-TFE_PP_ADDR_MAC_ADDR+odd_address] = 
             GET_PP_8(ppaddress+odd_address);
         set_mac((char*)tfe_ia_mac);
+            log_message(tfe_log,"set MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
+                        tfe_ia_mac[0],tfe_ia_mac[1],tfe_ia_mac[2],
+                        tfe_ia_mac[3],tfe_ia_mac[4],tfe_ia_mac[5]);
         
         if(odd_address && (ppaddress == TFE_PP_ADDR_MAC_ADDR+4))
             /*log_message(tfe_log,"set MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
@@ -1737,6 +1744,9 @@ void cs8900a_device::write(u16 address, u8 data) {
 }
 
 int cs8900a_device::recv_start_cb(u8 *buf, int length) {
+#ifdef TFE_DEBUG
+    printf("recv_start_cb(), %p len %d\n", buf, length);
+#endif
     std::vector<u8> frame;
     frame.assign(buf, buf+length);
     m_frame_queue.push(frame);

@@ -36,8 +36,13 @@ a2bus_uthernet_device::a2bus_uthernet_device(const machine_config &mconfig, devi
 		device_a2bus_card_interface(mconfig, *this),
 		m_started(false),
 		m_interface(mconfig.options().value(OPTION_UTHERNET_INTF)),
-		m_netinf(*this, "netinf")
+		m_netinf(*this, "cs8900a")
 {
+}
+
+void a2bus_uthernet_device::device_add_mconfig(machine_config &config)
+{
+	CS8900A(config, m_netinf, 0);
 }
 
 //-------------------------------------------------
