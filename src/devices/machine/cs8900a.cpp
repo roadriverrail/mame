@@ -685,6 +685,7 @@ u16 cs8900a_device::tfe_receive(void)
             len = frame.size();
             std::memcpy(buffer, frame.data(), len);
             newframe = 1;
+            rx_ok = 1;
         } else {
             newframe = 0;
         }
