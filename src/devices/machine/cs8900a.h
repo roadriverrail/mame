@@ -17,7 +17,7 @@
 
 #include <queue>
 
-#define TFE_COUNT_IO_REGISTER 0x10 /* we have 16 I/O register */
+#define CS8900_COUNT_IO_REGISTER 0x10 /* we have 16 I/O register */
 #define MAX_PACKETPAGE_ARRAY 0x1000 /* 4 KB */
 
 /***************************************************************************
@@ -42,25 +42,25 @@ protected:
 	virtual int recv_start_cb(u8 *buf, int length) override;
 
 private:
-	u8 tfe_ia_mac[6];
+	u8 cs8900_ia_mac[6];
 
-	u32 tfe_hash_mask[2];
+	u32 cs8900_hash_mask[2];
 
 	// CS8900A IO Registers
-	u8 tfe[TFE_COUNT_IO_REGISTER];
+	u8 cs8900_ioregs[CS8900_COUNT_IO_REGISTER];
 
 	// CS8900A PacketPage
-	u8 tfe_packetpage[MAX_PACKETPAGE_ARRAY];
-	u16 tfe_packetpage_ptr;
+	u8 cs8900_packetpage[MAX_PACKETPAGE_ARRAY];
+	u16 cs8900_packetpage_ptr;
 
 	/* reveiver setup */
-	u16 tfe_recv_control;	 /* copy of CC_RXCTL (contains all bits below) */
-	int tfe_recv_broadcast;	 /* broadcast */
-	int tfe_recv_mac;		 /* individual address (IA) */
-	int tfe_recv_multicast;	 /* multicast if address passes the hash filter */
-	int tfe_recv_correct;	 /* accept correct frames */
-	int tfe_recv_promiscuous; /* promiscuous mode */
-	int tfe_recv_hashfilter;	 /* accept if IA passes the hash filter */
+	u16 cs8900_recv_control;	 /* copy of CC_RXCTL (contains all bits below) */
+	int cs8900_recv_broadcast;	 /* broadcast */
+	int cs8900_recv_mac;		 /* individual address (IA) */
+	int cs8900_recv_multicast;	 /* multicast if address passes the hash filter */
+	int cs8900_recv_correct;	 /* accept correct frames */
+	int cs8900_recv_promiscuous; /* promiscuous mode */
+	int cs8900_recv_hashfilter;	 /* accept if IA passes the hash filter */
 
 
 
@@ -87,21 +87,21 @@ private:
 	//The frame queue
 	std::queue<std::vector<u8>> m_frame_queue;
 
-	void tfe_set_tx_status(int ready, int error);
-	void tfe_set_receiver(int enabled);
-	void tfe_set_transmitter(int enabled);
-	int tfe_should_accept(unsigned char *buffer, int length, int *phashed, int *phash_index, 
+	void cs8900_set_tx_status(int ready, int error);
+	void cs8900_set_receiver(int enabled);
+	void cs8900_set_transmitter(int enabled);
+	int cs8900_should_accept(unsigned char *buffer, int length, int *phashed, int *phash_index, 
                       int *pcorrect_mac, int *pbroadcast, int *pmulticast);
-	u16 tfe_receive(void);
-	void tfe_write_tx_buffer(u8 value,int odd_address);
-	u8 tfe_read_rx_buffer(int odd_address);
-	void tfe_sideeffects_write_pp(u16 ppaddress, int odd_address);
-	void tfe_sideeffects_read_pp(u16 ppaddress,int odd_address);
-	u16 tfe_read_register(u16 ppaddress);
-	void tfe_write_register(u16 ppaddress,u16 value);
-	void tfe_auto_incr_pp_ptr(void);
-	u8 tfe_read(u16 io_address);
-	void tfe_store(u16 io_address, u8 var);
+	u16 cs8900_receive(void);
+	void cs8900_write_tx_buffer(u8 value,int odd_address);
+	u8 cs8900_read_rx_buffer(int odd_address);
+	void cs8900_sideeffects_write_pp(u16 ppaddress, int odd_address);
+	void cs8900_sideeffects_read_pp(u16 ppaddress,int odd_address);
+	u16 cs8900_read_register(u16 ppaddress);
+	void cs8900_write_register(u16 ppaddress,u16 value);
+	void cs8900_auto_incr_pp_ptr(void);
+	u8 cs8900_read(u16 io_address);
+	void cs8900_store(u16 io_address, u8 var);
 	unsigned long crc32_buf(const char *buffer, unsigned int len);
 };
 
