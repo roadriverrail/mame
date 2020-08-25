@@ -4,9 +4,9 @@
 
     CS8900A ethernet controller implementation
 
-    by Rhett Aultman
-    modified from The Final Ethernet (TFE)
-    by Spiro Trikaliotis, Christian Vogelgsang
+    by Rhett Aultman <roadriverrail@gmail.com>
+    ported to MAME from VICE Project (https://sourceforge.net/p/vice-emu/)
+    VICE CS8900 code by Spiro Trikaliotis <Spiro.Trikaliotis@gmx.de>
 
 **************************************************************************/
 
@@ -16,6 +16,9 @@
 #pragma once
 
 #include <queue>
+
+#define TFE_COUNT_IO_REGISTER 0x10 /* we have 16 I/O register */
+#define MAX_PACKETPAGE_ARRAY 0x1000 /* 4 KB */
 
 /***************************************************************************
     TYPE DEFINITIONS
@@ -39,11 +42,16 @@ protected:
 	virtual int recv_start_cb(u8 *buf, int length) override;
 
 private:
-	int should_activate;
-	int init_tfe_flag;
 	u8 tfe_ia_mac[6];
 
 	u32 tfe_hash_mask[2];
+
+	// CS8900A IO Registers
+	u8 tfe[TFE_COUNT_IO_REGISTER];
+
+	// CS8900A PacketPage
+	u8 tfe_packetpage[MAX_PACKETPAGE_ARRAY];
+	u16 tfe_packetpage_ptr;
 
 	/* reveiver setup */
 	u16 tfe_recv_control;	 /* copy of CC_RXCTL (contains all bits below) */
@@ -54,18 +62,7 @@ private:
 	int tfe_recv_promiscuous; /* promiscuous mode */
 	int tfe_recv_hashfilter;	 /* accept if IA passes the hash filter */
 
-	/* Flag: Can we even use TFE, or is the hardware not available? */
-	int tfe_cannot_use;
 
-	/* Flag: Do we have the TFE enabled?  */
-	int tfe_enabled;
-
-	/* Flag: Do we use the "original" memory map or the memory map of the RR-Net? */
-	int tfe_as_rr_net;
-
-	char *tfe_interface;
-
-	u8 *tfe;
 
 	u16 tx_buffer;
 	u16 rx_buffer;
@@ -74,14 +71,6 @@ private:
 	u16 rx_count;
 	u16 tx_length;
 	u16 rx_length;
-
-#define TFE_TX_IDLE 0
-#define TFE_TX_GOT_CMD 1
-#define TFE_TX_GOT_LEN 2
-#define TFE_TX_READ_BUSST 3
-
-#define TFE_RX_IDLE 0
-#define TFE_RX_GOT_FRAME 1
 
 	/* tranceiver state */
 	int tx_state;
@@ -101,10 +90,6 @@ private:
 	void tfe_set_tx_status(int ready, int error);
 	void tfe_set_receiver(int enabled);
 	void tfe_set_transmitter(int enabled);
-	int tfe_deactivate(void);
-	int tfe_deactivate_i(void);
-	int tfe_activate(void);
-	void tfe_shutdown(void);
 	int tfe_should_accept(unsigned char *buffer, int length, int *phashed, int *phash_index, 
                       int *pcorrect_mac, int *pbroadcast, int *pmulticast);
 	u16 tfe_receive(void);

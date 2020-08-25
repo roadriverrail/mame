@@ -1,32 +1,40 @@
+// license:GPL-2.0+
+// copyright-holders:Rhett Aultman
+/*************************************************************************
+
+    CS8900A ethernet controller implementation
+
+    by Rhett Aultman <roadriverrail@gmail.com>
+    ported to MAME from VICE Project (https://sourceforge.net/p/vice-emu/)
+    VICE CS8900 code by Spiro Trikaliotis <Spiro.Trikaliotis@gmx.de>
+
+**************************************************************************/
+
 #include <cstring>
 
 #include "machine/cs8900a.h"
 
 DEFINE_DEVICE_TYPE(CS8900A,  cs8900a_device,  "CS8900A",  "CA8900A ETHERNET IC")
 
-
-#define CRC32_POLY  0xedb88320
-
 /* warn illegal behaviour */
 /* #define TFE_DEBUG_WARN_REG 1 */   /* warn about invalid register accesses */
 /* #define TFE_DEBUG_WARN_RXTX 1 */  /* warn about invalid rx or tx conditions */
 
-#define TFE_DEBUG 1 /* **/           /* enable to see tfe port reads */
+/** #define TFE_DEBUG 1 **/           /* enable to see tfe port reads */
 /** #define TFE_DEBUG_INIT 1 **/
-#define TFE_DEBUG_LOAD 1 /* **/           /* enable to see tfe port reads */
-#define TFE_DEBUG_STORE 1 /* **/          /* enable to see tfe port writes */
+/** #define TFE_DEBUG_LOAD 1  **/           /* enable to see tfe port reads */
+/** #define TFE_DEBUG_STORE 1  **/          /* enable to see tfe port writes */
 /** #define TFE_DEBUG_REGISTERS 1 **/      /* enable to see CS8900a register I/O */
 /** #define TFE_DEBUG_IGNORE_RXEVENT 1 **/ /* enable to ignore RXEVENT in DEBUG_REGISTERS */
 /** #define TFE_DEBUG_RXTX_STATE 1 **/     /* enable to see tranceiver state changes */
 /** #define TFE_DEBUG_RXTX_DATA 1 **/      /* enable to see data in/out flow */
 /** #define TFE_DEBUG_FRAMES 1 **/         /* enable to see arch frame send/recv */
 
-typedef signed int log_t;
-#define LOG_ERR     ((log_t)-1)
-#define LOG_DEFAULT ((log_t)-2)
-
-static log_t tfe_log = LOG_ERR;
 #define log_message(level,...) fprintf(stderr,__VA_ARGS__)
+
+#define MAX_FRAME_QUEUE_ENTRIES 4096
+
+#define CRC32_POLY  0xedb88320
 
 /* TFE registers */
 /* these are the 8 16-bit-ports for "I/O space configuration"
@@ -35,7 +43,6 @@ static log_t tfe_log = LOG_ERR;
    REMARK: The TFE operatoes the cs8900a in IO space configuration, as
    it generates I/OW and I/OR signals.
 */
-#define TFE_COUNT_IO_REGISTER 0x10 /* we have 16 I/O register */
 
 /*
     RW: RXTXDATA   = DE00/DE01
@@ -83,12 +90,6 @@ static log_t tfe_log = LOG_ERR;
 
 /* The PacketPage register */
 /* note: The locations 0 to MAX_PACKETPAGE_ARRAY-1 are handled in this array. */
-
-#define MAX_PACKETPAGE_ARRAY 0x1000 /* 4 KB */
-
-static u8 *tfe_packetpage = NULL;
-
-static u16 tfe_packetpage_ptr = 0;
 
 /* Makros for reading and writing the PacketPage register: */
 
@@ -202,22 +203,41 @@ static u16 tfe_packetpage_ptr = 0;
 #define MAX_RXLENGTH 1518
 #define MIN_RXLENGTH 64
 
+#define TFE_TX_IDLE 0
+#define TFE_TX_GOT_CMD 1
+#define TFE_TX_GOT_LEN 2
+#define TFE_TX_READ_BUSST 3
+
+#define TFE_RX_IDLE 0
+#define TFE_RX_GOT_FRAME 1
+
+#ifdef TFE_DEBUG_FRAMES
+    #define return( _x_ ) \
+    { \
+        int retval = _x_; \
+        \
+        log_message(tfe_log, "%s correct_mac=%u, broadcast=%u, multicast=%u, hashed=%u, hash_index=%u", (retval? "+++ ACCEPTED":"--- rejected"), *pcorrect_mac, *pbroadcast, *pmulticast, *phashed, *phash_index); \
+        \
+        return retval; \
+    }
+#endif
+
+#define PP_PTR_AUTO_INCR_FLAG 0x8000 /* auto increment flag in package pointer */
+#define PP_PTR_FLAG_MASK      0xf000 /* is always : x y 1 1 (with x=auto incr) */
+#define PP_PTR_ADDR_MASK      0x0fff /* address portion of packet page pointer */
+
+
+#define LO_BYTE(x)      (u8)((x) & 0xff)
+#define HI_BYTE(x)      (u8)(((x) >> 8) & 0xff)
+#define LOHI_WORD(x,y)  ( (u16)(x) | ( ((u16)(y)) <<8 ) )
+
+//------------------- END #defines ---------------------
+
+
 unsigned long cs8900a_device::crc32_buf(const char *buffer, unsigned int len)
 {
-    int i, j;
-    unsigned long crc, c;
+    unsigned long crc;
     const char *p;
-
-//TODO: move this into the constructor or start function
-    if (!crc32_is_initialized) {
-        for (i = 0; i < 256; i++) {
-            c = (unsigned long) i;
-            for (j = 0; j < 8; j++)
-                c = c & 1 ? CRC32_POLY ^ (c >> 1) : c >> 1;
-            crc32_table[i] = c;
-        }
-        crc32_is_initialized = 1;
-    }
 
     crc = 0xffffffff;
     for (p = buffer; len > 0; ++p, --len)
@@ -225,8 +245,6 @@ unsigned long cs8900a_device::crc32_buf(const char *buffer, unsigned int len)
     
     return ~crc;
 }
-
-
 
 void cs8900a_device::tfe_set_tx_status(int ready,int error)
 {
@@ -266,126 +284,71 @@ void cs8900a_device::tfe_set_transmitter(int enabled)
 
 void cs8900a_device::device_reset(void)
 {
-    if (tfe_enabled && !should_activate)
-    {
-        int i;
-        
-        assert( tfe );
-        assert( tfe_packetpage );
+    // Flush the inbound packet queue
+    std::queue<std::vector<u8>> empty_queue;
+    std::swap(m_frame_queue, empty_queue);
 
+    /* initialize visible IO register and PacketPage registers */
+    memset( tfe, 0, TFE_COUNT_IO_REGISTER );
+    memset( tfe_packetpage, 0, MAX_PACKETPAGE_ARRAY );
 
-        /* initialize visible IO register and PacketPage registers */
-        memset( tfe, 0, TFE_COUNT_IO_REGISTER );
-        memset( tfe_packetpage, 0, MAX_PACKETPAGE_ARRAY );
+    /* according to page 19 unless stated otherwise */
+    SET_PP_32(TFE_PP_ADDR_PRODUCTID,      0x0900630E ); /* p.41: 0E630009 for Rev. D; reversed order! */
+    SET_PP_16(TFE_PP_ADDR_IOBASE,         0x0300);
+    SET_PP_16(TFE_PP_ADDR_INTNO,          0x0004); /* xxxx xxxx xxxx x100b */
+    SET_PP_16(TFE_PP_ADDR_DMA_CHAN,       0x0003); /* xxxx xxxx xxxx xx11b */
 
-        /* according to page 19 unless stated otherwise */
-        SET_PP_32(TFE_PP_ADDR_PRODUCTID,      0x0900630E ); /* p.41: 0E630009 for Rev. D; reversed order! */
-		SET_PP_16(TFE_PP_ADDR_IOBASE,         0x0300);
-        SET_PP_16(TFE_PP_ADDR_INTNO,          0x0004); /* xxxx xxxx xxxx x100b */
-        SET_PP_16(TFE_PP_ADDR_DMA_CHAN,       0x0003); /* xxxx xxxx xxxx xx11b */
+    /* according to descriptions of the registers, see definitions of 
+    TFE_PP_ADDR_CC_... and TFE_PP_ADDR_SE_... above! */
 
-#if 0 /* not needed since all memory is initialized with 0 */
-        SET_PP_16(TFE_PP_ADDR_DMA_SOF,        0x0000);
-        SET_PP_16(TFE_PP_ADDR_DMA_FC,         0x0000); /* x000h */
-        SET_PP_16(TFE_PP_ADDR_RXDMA_BC,       0x0000);
-        SET_PP_32(TFE_PP_ADDR_MEMBASE,        0x0000); /* xxx0 0000h */
-        SET_PP_32(TFE_PP_ADDR_BPROM_BASE,     0x00000000); /* xxx0 0000h */
-        SET_PP_32(TFE_PP_ADDR_BPROM_MASK,     0x00000000); /* xxx0 0000h */
+    SET_PP_16(TFE_PP_ADDR_CC_RXCFG,       0x0003);
+    SET_PP_16(TFE_PP_ADDR_CC_RXCTL,       0x0005);
+    SET_PP_16(TFE_PP_ADDR_CC_TXCFG,       0x0007);
+    SET_PP_16(TFE_PP_ADDR_CC_TXCMD,       0x0009);
+    SET_PP_16(TFE_PP_ADDR_CC_BUFCFG,      0x000B);
+    SET_PP_16(TFE_PP_ADDR_CC_LINECTL,     0x0013);
+    SET_PP_16(TFE_PP_ADDR_CC_SELFCTL,     0x0015);
+    SET_PP_16(TFE_PP_ADDR_CC_BUSCTL,      0x0017);
+    SET_PP_16(TFE_PP_ADDR_CC_TESTCTL,     0x0019);
 
-        SET_PP_16(TFE_PP_ADDR_SE_ISQ,         0x0000); /* p. 51 */
-#endif
+    SET_PP_16(TFE_PP_ADDR_SE_ISQ,         0x0000);
+    SET_PP_16(TFE_PP_ADDR_SE_RXEVENT,     0x0004);
+    SET_PP_16(TFE_PP_ADDR_SE_TXEVENT,     0x0008);
+    SET_PP_16(TFE_PP_ADDR_SE_BUFEVENT,    0x000C);
+    SET_PP_16(TFE_PP_ADDR_SE_RXMISS,      0x0010);
+    SET_PP_16(TFE_PP_ADDR_SE_TXCOL,       0x0012);
+    SET_PP_16(TFE_PP_ADDR_SE_LINEST,      0x0014);
+    SET_PP_16(TFE_PP_ADDR_SE_SELFST,      0x0016);
+    SET_PP_16(TFE_PP_ADDR_SE_BUSST,       0x0018);
+    SET_PP_16(TFE_PP_ADDR_SE_TDR,         0x001C);
+    
+    SET_PP_16(TFE_PP_ADDR_TXCMD,          0x0009);
 
-        /* according to descriptions of the registers, see definitions of 
-        TFE_PP_ADDR_CC_... and TFE_PP_ADDR_SE_... above! */
+    /* 4.4.19 Self Status Register, p. 65
+       Important: set INITD (Bit 7) to signal device is ready */
+    SET_PP_16(TFE_PP_ADDR_SE_SELFST,      0x0896);
 
-        SET_PP_16(TFE_PP_ADDR_CC_RXCFG,       0x0003);
-        SET_PP_16(TFE_PP_ADDR_CC_RXCTL,       0x0005);
-        SET_PP_16(TFE_PP_ADDR_CC_TXCFG,       0x0007);
-        SET_PP_16(TFE_PP_ADDR_CC_TXCMD,       0x0009);
-        SET_PP_16(TFE_PP_ADDR_CC_BUFCFG,      0x000B);
-        SET_PP_16(TFE_PP_ADDR_CC_LINECTL,     0x0013);
-        SET_PP_16(TFE_PP_ADDR_CC_SELFCTL,     0x0015);
-        SET_PP_16(TFE_PP_ADDR_CC_BUSCTL,      0x0017);
-        SET_PP_16(TFE_PP_ADDR_CC_TESTCTL,     0x0019);
-
-        SET_PP_16(TFE_PP_ADDR_SE_ISQ,         0x0000);
-        SET_PP_16(TFE_PP_ADDR_SE_RXEVENT,     0x0004);
-        SET_PP_16(TFE_PP_ADDR_SE_TXEVENT,     0x0008);
-        SET_PP_16(TFE_PP_ADDR_SE_BUFEVENT,    0x000C);
-        SET_PP_16(TFE_PP_ADDR_SE_RXMISS,      0x0010);
-        SET_PP_16(TFE_PP_ADDR_SE_TXCOL,       0x0012);
-        SET_PP_16(TFE_PP_ADDR_SE_LINEST,      0x0014);
-        SET_PP_16(TFE_PP_ADDR_SE_SELFST,      0x0016);
-        SET_PP_16(TFE_PP_ADDR_SE_BUSST,       0x0018);
-        SET_PP_16(TFE_PP_ADDR_SE_TDR,         0x001C);
-        
-        SET_PP_16(TFE_PP_ADDR_TXCMD,          0x0009);
-
-        /* 4.4.19 Self Status Register, p. 65
-           Important: set INITD (Bit 7) to signal device is ready */
-        SET_PP_16(TFE_PP_ADDR_SE_SELFST,      0x0896);
-
-        tfe_recv_control = GET_PP_16(TFE_PP_ADDR_CC_RXCTL);
-        
-        /* spec: mac address is undefined after reset.
-           real HW: keeps the last set address. */
-        for(i=0;i<6;i++)
-            SET_PP_8(TFE_PP_ADDR_MAC_ADDR+i,tfe_ia_mac[i]);
-        
-        /* reset state */
-        tfe_set_transmitter(0);
-        tfe_set_receiver(0);
-
-        printf("CS8900a device_reset\n");
-    }
+    tfe_recv_control = GET_PP_16(TFE_PP_ADDR_CC_RXCTL);
+    
+    /* spec: mac address is undefined after reset.
+       real HW: keeps the last set address. */
+    for(int i=0;i<6;i++)
+        SET_PP_8(TFE_PP_ADDR_MAC_ADDR+i,tfe_ia_mac[i]);
+    
+    /* reset state */
+    tfe_set_transmitter(0);
+    tfe_set_receiver(0);
 }
 
 void cs8900a_device::device_start(void)
 {
-    assert( tfe == NULL );
-    assert( tfe_packetpage == NULL );
-
 #ifdef TFE_DEBUG
     log_message( tfe_log, "device_start().\n" );
 #endif
 
-    /* allocate memory for visible IO register */
-    tfe = (u8 *)malloc( TFE_COUNT_IO_REGISTER );
-    if (tfe==NULL)
-    {
 #ifdef TFE_DEBUG_INIT
-        log_message(tfe_log, "tfe_activate_i: Allocating tfe failed.");
-#endif
-        tfe_enabled = 0;
-        return;
-    }
-
-    /* allocate memory for PacketPage register */
-    tfe_packetpage = (u8 *)malloc( MAX_PACKETPAGE_ARRAY );
-    if (tfe_packetpage==NULL)
-    {
-#ifdef TFE_DEBUG_INIT
-        log_message(tfe_log, "tfe_activate: Allocating tfe_packetpage failed.");
-#endif
-        free(tfe);
-        tfe=NULL;
-        tfe_enabled = 0;
-        return;
-    }
-
-#ifdef TFE_DEBUG_INIT
-    log_message(tfe_log, "tfe_activate: Allocated memory successfully.");
     log_message(tfe_log, "\ttfe at $%08X, tfe_packetpage at $%08X", tfe, tfe_packetpage );
 #endif
-
-#ifdef DOS_TFE
-    set_standard_tfe_interface();
-#endif
-
-// TODO: This code used to call tfe_arch_activate(),
-// which opened the PCAP adapter.  I get the impression
-// this is "done for us" by MAME, but we might need some
-// equivalent call here?
 
     /* virtually reset the LAN chip */
     device_reset();
@@ -393,128 +356,37 @@ void cs8900a_device::device_start(void)
     return; 
 }
 
-int cs8900a_device::tfe_deactivate_i(void)
-{
-#ifdef TFE_DEBUG
-    log_message( tfe_log, "tfe_deactivate_i()." );
-#endif
-
-    assert(tfe && tfe_packetpage);
-
-    free(tfe);
-    tfe = NULL;
-    free(tfe_packetpage);
-    tfe_packetpage = NULL;
-    return 0;
-}
-
-
-int cs8900a_device::tfe_deactivate(void) {
-#ifdef TFE_DEBUG
-    log_message( tfe_log, "tfe_deactivate()." );
-#endif
-
-    if (should_activate)
-        should_activate = 0;
-    else {
-        if (tfe_log != LOG_ERR)
-            return tfe_deactivate_i();
-    }
-
-    return 0;
-}
-
-int cs8900a_device::tfe_activate(void) {
-#ifdef TFE_DEBUG
-    log_message( tfe_log, "tfe_activate()." );
-#endif
-
-    if (init_tfe_flag) {
-        device_start();
-    }
-    else {
-        should_activate = 1;
-    }
-    return 0;
-}
-
-
 cs8900a_device::cs8900a_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock)
 	: device_t(mconfig, type, tag, owner, clock)
 	, device_network_interface(mconfig, *this, 10.0f)
     , tfe_ia_mac{0, 0, 0, 0, 0, 0}
+	, tfe_packetpage_ptr(0)
+	, tfe_recv_control(0)	 /* copy of CC_RXCTL (contains all bits below) */
+	, tfe_recv_broadcast(0)	 /* broadcast */
+	, tfe_recv_mac(0)		 /* individual address (IA) */
+	, tfe_recv_multicast(0)	 /* multicast if address passes the hash filter */
+	, tfe_recv_correct(0)	 /* accept correct frames */
+	, tfe_recv_promiscuous(0) /* promiscuous mode */
+	, tfe_recv_hashfilter(0)	 /* accept if IA passes the hash filter */
+	, tx_buffer(TFE_PP_ADDR_TX_FRAMELOC)
+	, rx_buffer(TFE_PP_ADDR_RXSTATUS)
+	, tx_count(0)
+	, rx_count(0)
+	, tx_length(0)
+	, rx_length(0)
+	, tx_state(TFE_TX_IDLE)
+	, rx_state(TFE_RX_IDLE)
+	, tx_enabled(0)
+	, rx_enabled(0)
+	, rxevent_read_mask(3) /* set if L and/or H u8 was read in RXEVENT? */
 {
-// early variable setup to establish defaults
-	crc32_is_initialized = 0;
-	should_activate = 0;
-	init_tfe_flag = 0;
-// TODO: Move the rest of this crap up to the initializer list
-//	tfe_ia_mac = {0, 0, 0, 0, 0, 0};
-
-	/* reveiver setup */
-	tfe_recv_control = 0;	 /* copy of CC_RXCTL (contains all bits below) */
-	tfe_recv_broadcast = 0;	 /* broadcast */
-	tfe_recv_mac = 0;		 /* individual address (IA) */
-	tfe_recv_multicast = 0;	 /* multicast if address passes the hash filter */
-	tfe_recv_correct = 0;	 /* accept correct frames */
-	tfe_recv_promiscuous = 0; /* promiscuous mode */
-	tfe_recv_hashfilter = 0;	 /* accept if IA passes the hash filter */
-
-	/* Flag: Can we even use TFE, or is the hardware not available? */
-	tfe_cannot_use = 0;
-
-	/* Flag: Do we have the TFE enabled?  */
-	tfe_enabled = 0;
-
-	/* Flag: Do we use the "original" memory map or the memory map of the RR-Net? */
-	tfe_as_rr_net = 0;
-
-	tfe_interface = NULL;
-
-	tfe = NULL;
-
-	tx_buffer = TFE_PP_ADDR_TX_FRAMELOC;
-	rx_buffer = TFE_PP_ADDR_RXSTATUS;
-
-	tx_count = 0;
-	rx_count = 0;
-	tx_length = 0;
-	rx_length = 0;
-
-#define TFE_TX_IDLE 0
-#define TFE_TX_GOT_CMD 1
-#define TFE_TX_GOT_LEN 2
-#define TFE_TX_READ_BUSST 3
-
-#define TFE_RX_IDLE 0
-#define TFE_RX_GOT_FRAME 1
-
-	/* tranceiver state */
-	tx_state = TFE_TX_IDLE;
-	rx_state = TFE_RX_IDLE;
-	tx_enabled = 0;
-	rx_enabled = 0;
-
-	rxevent_read_mask = 3; /* set if L and/or H u8 was read in RXEVENT? */
-
-
-// post-preamble setup	
-    tfe_enabled = 1;
-	init_tfe_flag = 1;
-	should_activate = 1;
-
-    if (should_activate) {
-        should_activate = 0;
-//TODO: Scrub off the should_activate code, since this is handled through MAME calling
-//device_start instead.
-#if 0
-        if (tfe_activate() < 0) {
-            tfe_enabled = 0;
-            tfe_cannot_use = 1;
-        }
-#endif
+// Initialize the CRC table
+    for (int i = 0; i < 256; i++) {
+        unsigned long c = (unsigned long) i;
+        for (int j = 0; j < 8; j++)
+            c = c & 1 ? CRC32_POLY ^ (c >> 1) : c >> 1;
+        crc32_table[i] = c;
     }
-     
 }
 
 cs8900a_device::cs8900a_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -523,53 +395,9 @@ cs8900a_device::cs8900a_device(machine_config const &mconfig, char const *tag, d
 }
 
 
-void cs8900a_device::tfe_shutdown(void)
-{
-    assert( (tfe && tfe_packetpage) || (!tfe && !tfe_packetpage));
-
-    if (tfe)
-        tfe_deactivate();
-
-    if (tfe_interface != NULL)
-        free(tfe_interface);
-}
-
-/* ------------------------------------------------------------------------- */
-/*    reading and writing TFE register functions                             */
-
-/*
-These registers are currently fully or partially supported:
-
-TFE_PP_ADDR_CC_RXCFG        0x0102 * # RW - 4.4.6.,  p. 52 - 0003 *
-TFE_PP_ADDR_CC_RXCTL        0x0104 * # RW - 4.4.8.,  p. 54 - 0005 *
-TFE_PP_ADDR_CC_LINECTL      0x0112 * # RW - 4.4.16., p. 62 - 0013 *
-TFE_PP_ADDR_SE_RXEVENT      0x0124 * # R- - 4.4.7.,  p. 53 - 0004 *
-TFE_PP_ADDR_SE_BUSST        0x0138 * # R- - 4.4.21., p. 67 - 0018 *
-TFE_PP_ADDR_TXCMD           0x0144 * # -W - 4.5., p. 70 - 5.7., p. 98 *
-TFE_PP_ADDR_TXLENGTH        0x0146 * # -W - 4.5., p. 70 - 5.7., p. 98 *
-TFE_PP_ADDR_MAC_ADDR        0x0158 * # RW - 4.6., p. 71 - 5.3., p. 86 *
-                            0x015a
-                            0x015c
-*/
-
-
-#ifdef TFE_DEBUG_FRAMES
-    #define return( _x_ ) \
-    { \
-        int retval = _x_; \
-        \
-        log_message(tfe_log, "%s correct_mac=%u, broadcast=%u, multicast=%u, hashed=%u, hash_index=%u", (retval? "+++ ACCEPTED":"--- rejected"), *pcorrect_mac, *pbroadcast, *pmulticast, *phashed, *phash_index); \
-        \
-        return retval; \
-    }
-
-#endif
 /*
  This is a helper for tfe_receive() to determine if the received frame should be accepted
  according to the settings.
-
- This function is even allowed to be called in tfearch.c from tfe_arch_receive() if 
- necessary, which is the reason why its prototype is included here in tfearch.h.
 */
 int cs8900a_device::tfe_should_accept(unsigned char *buffer, int length, int *phashed, int *phash_index, 
                       int *pcorrect_mac, int *pbroadcast, int *pmulticast) 
@@ -593,7 +421,6 @@ int cs8900a_device::tfe_should_accept(unsigned char *buffer, int length, int *ph
         debug_outbuffer(length, buffer)
         );
 #endif
-
 
     if (   buffer[0]==tfe_ia_mac[0]
         && buffer[1]==tfe_ia_mac[1]
@@ -690,18 +517,6 @@ u16 cs8900a_device::tfe_receive(void)
             newframe = 0;
         }
 
-#if 0
-        newframe = tfe_arch_receive(
-            buffer,       /* where to store a frame */
-            &len,         /* length of received frame */
-            &hashed,      /* set if the dest. address is accepted by the hash filter */
-            &hash_index,  /* hash table index if hashed == TRUE */   
-            &rx_ok,       /* set if good CRC and valid length */
-            &correct_mac, /* set if dest. address is exactly our IA */
-            &broadcast,   /* set if dest. address is a broadcast address */
-            &crc_error    /* set if received frame had a CRC error */
-            );
-#endif
         assert((len&1) == 0); /* length has to be even! */
 
         if (newframe) {
@@ -723,7 +538,6 @@ u16 cs8900a_device::tfe_receive(void)
                     continue;
                 }
             }
-
 
             /* we did receive a frame, return that status */
             ret_val |= rx_ok     ? 0x0100 : 0;
@@ -791,6 +605,24 @@ u16 cs8900a_device::tfe_receive(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/*    reading and writing TFE register functions                             */
+
+/*
+These registers are currently fully or partially supported:
+
+TFE_PP_ADDR_CC_RXCFG        0x0102 * # RW - 4.4.6.,  p. 52 - 0003 *
+TFE_PP_ADDR_CC_RXCTL        0x0104 * # RW - 4.4.8.,  p. 54 - 0005 *
+TFE_PP_ADDR_CC_LINECTL      0x0112 * # RW - 4.4.16., p. 62 - 0013 *
+TFE_PP_ADDR_SE_RXEVENT      0x0124 * # R- - 4.4.7.,  p. 53 - 0004 *
+TFE_PP_ADDR_SE_BUSST        0x0138 * # R- - 4.4.21., p. 67 - 0018 *
+TFE_PP_ADDR_TXCMD           0x0144 * # -W - 4.5., p. 70 - 5.7., p. 98 *
+TFE_PP_ADDR_TXLENGTH        0x0146 * # -W - 4.5., p. 70 - 5.7., p. 98 *
+TFE_PP_ADDR_MAC_ADDR        0x0158 * # RW - 4.6., p. 71 - 5.3., p. 86 *
+                            0x015a
+                            0x015c
+*/
+
+/* ------------------------------------------------------------------------- */
 /* TX/RX buffer handling */
 
 void cs8900a_device::tfe_write_tx_buffer(u8 value,int odd_address)
@@ -839,24 +671,10 @@ void cs8900a_device::tfe_write_tx_buffer(u8 value,int odd_address)
 #endif
             } else {
                 /* send frame */
-                u16 txcmd = GET_PP_16(TFE_PP_ADDR_CC_TXCMD);
-                if (txcmd) {
-                    txcmd = 0; //Jiggery pokery to ensure any side effects are preserved
-                }
 #ifdef TFE_DEBUG
                 printf("SENDING from buf %p len %d\n", &tfe_packetpage[TFE_PP_ADDR_TX_FRAMELOC], tx_length);
 #endif
                 send(&tfe_packetpage[TFE_PP_ADDR_TX_FRAMELOC],tx_length);
-#if 0 //Note that the txcmd is completely ignored in tfe_arch_transmit()
-                tfe_arch_transmit(
-                    txcmd & 0x0100 ? 1 : 0,   /* FORCE: Delete waiting frames in transmit buffer */
-                    txcmd & 0x0200 ? 1 : 0,   /* ONECOLL: Terminate after just one collision */
-                    txcmd & 0x1000 ? 1 : 0,   /* INHIBITCRC: Do not append CRC to the transmission */
-                    txcmd & 0x2000 ? 1 : 0,   /* TXPADDIS: Disable padding to 60/64 octets */
-                    tx_length,
-                    &tfe_packetpage[TFE_PP_ADDR_TX_FRAMELOC]         
-                    );
-#endif
             }
 
             /* reset transmitter state */
@@ -943,8 +761,6 @@ u8 cs8900a_device::tfe_read_rx_buffer(int odd_address)
 */
 void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
 {
-//    const char *on_off[2] = { "on","off" };
-//#define on_off_str(x) ((x) ? on_off[0] : on_off[1])
     u16 content = GET_PP_16( ppaddress );
 
     assert((ppaddress & 1) == 0);
@@ -954,9 +770,7 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
     case TFE_PP_ADDR_CC_RXCFG:
         /* Skip_1 Flag: remove current (partial) tx frame and restore state */
         if (content & 0x40) {
-            
-/*          tfe_arch_receive_remove_committed_frame(); */            
-            
+
             /* restore tx state */ 
             if(tx_state!=TFE_TX_IDLE) {
                 tx_state = TFE_TX_IDLE;
@@ -983,24 +797,6 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
             tfe_recv_promiscuous = content & 0x0080; /* promiscuous mode */
             tfe_recv_hashfilter  = content & 0x0040; /* accept if IA passes the hash filter */
             tfe_recv_control     = content;
-        
-            /*log_message(tfe_log,"setup receiver: broadcast=%s mac=%s multicast=%s correct=%s promiscuous=%s hashfilter=%s",
-                        on_off_str(tfe_recv_broadcast),
-                        on_off_str(tfe_recv_mac),
-                        on_off_str(tfe_recv_multicast),
-                        on_off_str(tfe_recv_correct),
-                        on_off_str(tfe_recv_promiscuous),
-                        on_off_str(tfe_recv_hashfilter));*/
-
-/* this did nothing in TFE anyway
-            tfe_arch_recv_ctl( tfe_recv_broadcast,
-                               tfe_recv_mac,
-                               tfe_recv_multicast,
-                               tfe_recv_correct,
-                               tfe_recv_promiscuous,
-                               tfe_recv_hashfilter
-                             );
-*/
         }
         break;
 
@@ -1010,15 +806,8 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
             int enable_rx = (content & 0x0040) == 0x0040;
     
             if((enable_tx!=tx_enabled)||(enable_rx!=rx_enabled)) {
-/* This does nothing in tfearch.c
-                tfe_arch_line_ctl(enable_tx,enable_rx);
-*/
                 tfe_set_transmitter(enable_tx);
                 tfe_set_receiver(enable_rx);
-            
-                /*log_message(tfe_log,"line control: transmitter=%s receiver=%s",
-                            on_off_str(enable_tx),
-                            on_off_str(enable_rx));*/
             }
         }
         break;
@@ -1110,19 +899,6 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
 
             *p &= ~(0xFF << pos); /* clear out relevant bits */
             *p |= GET_PP_8(ppaddress+odd_address) << pos;
-
-            // tfe_arch_set_hashfilter(tfe_hash_mask);
-
-#if 0
-            if(odd_address && (ppaddress == TFE_PP_ADDR_LOG_ADDR_FILTER+6))
-                log_message(tfe_log,"set hash filter: %02x:%02x:%02x:%02x:%02x:%02x",
-                            tfe_hash_mask[0],
-                            tfe_hash_mask[1],
-                            tfe_hash_mask[2],
-                            tfe_hash_mask[3],
-                            tfe_hash_mask[4],
-                            tfe_hash_mask[5]);
-#endif
         }
         break;
 
@@ -1133,17 +909,14 @@ void cs8900a_device::tfe_sideeffects_write_pp(u16 ppaddress, int odd_address)
         tfe_ia_mac[ppaddress-TFE_PP_ADDR_MAC_ADDR+odd_address] = 
             GET_PP_8(ppaddress+odd_address);
         set_mac((char*)tfe_ia_mac);
+#ifdef TFE_DEBUG
+        if(odd_address && (ppaddress == TFE_PP_ADDR_MAC_ADDR+4))
             log_message(tfe_log,"set MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
                         tfe_ia_mac[0],tfe_ia_mac[1],tfe_ia_mac[2],
                         tfe_ia_mac[3],tfe_ia_mac[4],tfe_ia_mac[5]);
-        
-        if(odd_address && (ppaddress == TFE_PP_ADDR_MAC_ADDR+4))
-            /*log_message(tfe_log,"set MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
-                        tfe_ia_mac[0],tfe_ia_mac[1],tfe_ia_mac[2],
-                        tfe_ia_mac[3],tfe_ia_mac[4],tfe_ia_mac[5]);*/
+#endif
         break;
     }
-#undef on_off_str
 }
 
 /*
@@ -1509,10 +1282,6 @@ void cs8900a_device::tfe_write_register(u16 ppaddress,u16 value)
   SET_PP_16(ppaddress, value);  
 }
 
-#define PP_PTR_AUTO_INCR_FLAG 0x8000 /* auto increment flag in package pointer */
-#define PP_PTR_FLAG_MASK      0xf000 /* is always : x y 1 1 (with x=auto incr) */
-#define PP_PTR_ADDR_MASK      0x0fff /* address portion of packet page pointer */
-
 void cs8900a_device::tfe_auto_incr_pp_ptr(void)
 {
   /* perform auto increment of packet page pointer */
@@ -1528,10 +1297,6 @@ void cs8900a_device::tfe_auto_incr_pp_ptr(void)
 /* ------------------------------------------------------------------------- */
 /* read/write TFE registers from VICE */
 
-#define LO_BYTE(x)      (u8)((x) & 0xff)
-#define HI_BYTE(x)      (u8)(((x) >> 8) & 0xff)
-#define LOHI_WORD(x,y)  ( (u16)(x) | ( ((u16)(y)) <<8 ) )
-
 /* ----- read byte from I/O range in VICE ----- */
 u8 cs8900a_device::tfe_read(u16 io_address)
 {
@@ -1543,20 +1308,14 @@ u8 cs8900a_device::tfe_read(u16 io_address)
     assert( tfe_packetpage );
     assert( io_address < 0x10);
 
-    /*if (tfe_as_rr_net) {
-        // rr status register is handled by rr cartidge 
-        if (io_address < 0x02) {
-            return 0;
-        }
-        io_address ^= 0x08;
-    }*/
     /* register base addr */
     reg_base = io_address & ~1;
 
     /* RX register is special as it reads from RX buffer directly */
     if((reg_base==TFE_ADDR_RXTXDATA)||(reg_base==TFE_ADDR_RXTXDATA2)) {
-        //io_source=IO_SOURCE_TFE_RR_NET;
+#ifdef TFE_DEBUG_LOAD
         log_message(tfe_log, "reading RX Register.\n");
+#endif
         return tfe_read_rx_buffer(io_address & 0x01);
     }
     
@@ -1638,13 +1397,6 @@ void cs8900a_device::tfe_store(u16 io_address, u8 var)
     assert( tfe_packetpage );
     assert( io_address < 0x10);
 
-    /*if (tfe_as_rr_net) {
-        // rr control register is handled by rr cartidge
-        if (io_address < 0x02) {
-            return;
-        }
-        io_address ^= 0x08;
-    }*/
 #ifdef TFE_DEBUG_STORE
     log_message(tfe_log, "store [$%02X] <= $%02X.\n", io_address, (int)var);
 #endif
@@ -1748,8 +1500,26 @@ int cs8900a_device::recv_start_cb(u8 *buf, int length) {
 #ifdef TFE_DEBUG
     printf("recv_start_cb(), %p len %d\n", buf, length);
 #endif
-    std::vector<u8> frame;
-    frame.assign(buf, buf+length);
-    m_frame_queue.push(frame);
+    // Make an extra call to tfe_should_accept() on the receive
+    // callback to reduce the number of packets queueing up that
+    // will just get rejected anyway.
+    int phashed = 0;
+    int phash_index = 0;
+    int pcorrect_mac = 0;
+    int pbroadcast = 0;
+    int pmulticast = 0;
+    if (tfe_should_accept(buf, length, &phashed, &phash_index, &pcorrect_mac, &pbroadcast, &pmulticast)) {
+        std::vector<u8> frame;
+        frame.assign(buf, buf+length);
+        m_frame_queue.push(frame);
+
+        // In order to ensure the frame queue doesn't grow without bound, evict from the front
+        // when too many packets pile up.  This could happen due to a DOS or to the card not being
+        // in use and stray packets enter.
+
+        if (m_frame_queue.size() > MAX_FRAME_QUEUE_ENTRIES) {
+            m_frame_queue.pop();
+        }
+    }
     return length;
 }
